@@ -56,6 +56,8 @@ mkdir -p ~/.claude/skills/vlog-planner && cp -r Vlog-Planner/* ~/.claude/skills/
 3. `config.json` 里 `weather` 改 `"provider":"qweather"`，填 `key` 和 `base`（你的 Host）。免费版覆盖 7 天日预报 + 24h 逐时。
 
 出片"口味"也能调：`planning.shootable_threshold` = `lenient` / `balanced`（默认）/ `strict`。
+
+**一开始没配、之后想加 key？** 任何时候都行、**无需重装**：直接跟你的 Agent 说一句「**我要配高德 / 和风 key**」，它会带你走上面几步并帮你改好 `config.json`；或你自己编辑 `config.json` 保存，下次规划自动生效。（安装后首次规划时，Skill 也会主动问你一次用免费默认还是配 key。）
 </details>
 
 ## 老实说的局限（手册里也会标注）
