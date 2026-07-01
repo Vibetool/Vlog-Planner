@@ -1,0 +1,54 @@
+{
+  "_comment": "vlog-planner config. Copy to config.json and edit. Everything defaults to FREE / no-key. Fill a key only to upgrade a single data source; the skill keeps working without any.",
+
+  "region": "auto",
+  "_region_help": "auto | china | international. Controls default providers, output language and the data-quality notes printed in the manual.",
+
+  "language": "zh-CN",
+  "_language_help": "Output + geocoding language, e.g. zh-CN or en.",
+
+  "providers": {
+    "weather": {
+      "provider": "open-meteo",
+      "_provider_help": "open-meteo (free, no key, global) | qweather (China, needs key) | openweather (global, needs key)",
+      "qweather": { "key": "", "base": "https://YOUR-HOST.qweatherapi.com" },
+      "_qweather_help": "base = 你在 console.qweather.com/setting 拿到的【专属 API Host】(如 abcxyz.qweatherapi.com)。老的 devapi.qweather.com 共享域名 2026 起停用，别再用。key 直接填 API KEY。",
+      "openweather": { "key": "" }
+    },
+    "geocode": {
+      "provider": "nominatim",
+      "_provider_help": "nominatim (free, no key) | amap (China, far better POI/road data, needs key)",
+      "amap": { "key": "" },
+      "_amap_help": "高德 key 必须选【服务平台=Web服务】那一类，且账号需【实名认证】才有免费额度；console.amap.com 创建。geocode/poi 共用同一个 Web服务 key。"
+    },
+    "poi": {
+      "provider": "overpass",
+      "_provider_help": "overpass (free OSM, patchy in China) | amap (needs key) | none (only use the route you give)",
+      "radius_m": 8000,
+      "amap": { "key": "" }
+    },
+    "sun": {
+      "provider": "builtin",
+      "_provider_help": "Always local astronomy math. No key, works offline, identical worldwide."
+    }
+  },
+
+  "planning": {
+    "_read_by": "shootable_threshold + daily_window 由 plan.py 读取；max_spots_per_day / pace / prefer_golden_hour 由 Claude 在排日程时参考（SKILL.md 步骤 1-2），脚本不直接读。",
+    "shootable_threshold": "balanced",
+    "_shootable_threshold_help": "[plan.py] lenient = 除非完全没法拍都拍 | balanced = 给差光/大雨的点打 plan B | strict = 只推荐强光晴朗窗口",
+    "daily_window": ["06:00", "20:00"],
+    "_daily_window_help": "[plan.py] 白天兜底拍摄窗口的边界（黄金时刻之外）。",
+    "max_spots_per_day": 4,
+    "pace": "relaxed",
+    "_pace_help": "[Claude] relaxed | normal | packed — 每天排几个点/赶不赶。",
+    "prefer_golden_hour": true,
+    "_prefer_golden_hour_help": "[Claude] 排序时是否优先把点安排到黄金时刻。"
+  },
+
+  "style": {
+    "vibe": "治愈",
+    "_vibe_help": "Free text mood that flavors the A-roll/B-roll suggestions, e.g. 治愈 / 史诗感 / citywalk / 复古胶片.",
+    "gear": ["主相机 + 广角", "长焦镜头", "DJI Osmo Pocket 3", "手机"]
+  }
+}

@@ -1,0 +1,9 @@
+# Local config with API keys — never commit
+config.json
+
+# Generated plans / scratch
+*.plan.json
+out/
+__pycache__/
+*.pyc
+.DS_Store
