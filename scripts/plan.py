@@ -29,8 +29,12 @@ import _common as C
 import geocode as G
 import weather as W
 import sun as S
+import poi as P
 
 CUTS = {"lenient": 1.3, "balanced": 2.3, "strict": 3.3}
+# precip-probability % at/above which an hour counts as "wet" for the
+# dry-window / rain-onset scans (looser->stricter with the shootable口味).
+PP_CUTS = {"lenient": 60, "balanced": 50, "strict": 40}
 WEEKDAYS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
 
@@ -68,8 +72,13 @@ def score_window(agg):
         s -= 0.8
     elif cloud <= 10:
         s -= 0.2  # bald clear sky a touch less interesting at golden hour
-    if vis is not None and vis < 5:
-        s -= 1
+    if vis is not None:
+        if vis < 1:
+            s -= 3      # whiteout / 你就在云里 — effectively unshootable
+        elif vis < 2:
+            s -= 2
+        elif vis < 5:
+            s -= 1
     return round(max(0.0, min(5.0, s)), 1)
 
 
@@ -111,6 +120,60 @@ def aggregate(hours, start_hm, end_hm):
     }
 
 
+def _hours_in(hours, start_hm, end_hm):
+    sh, eh = int(start_hm[:2]), int(end_hm[:2])
+    return [h for h in hours if sh <= int(h["time"][:2]) <= eh]
+
+
+def _is_dry(h, pp_cut):
+    if (h.get("precip") or 0) >= 0.5:
+        return False
+    pp = h.get("precip_prob")
+    return not (pp is not None and pp >= pp_cut)
+
+
+def best_dry_window(hours, day_start, day_end, pp_cut):
+    """Longest contiguous 'dry enough to shoot/hike' run within daylight
+    [day_start, day_end]. Answers: the daily precip_prob_max hides a clear
+    morning — where exactly is it? Returns {start,end,hours,cloud,precip_prob} or None."""
+    best, run = None, []
+
+    def flush():
+        nonlocal best
+        if not run:
+            return
+        clouds = [x["cloud"] for x in run if isinstance(x.get("cloud"), (int, float))]
+        pps = [x["precip_prob"] for x in run if isinstance(x.get("precip_prob"), (int, float))]
+        cand = {"start": run[0]["time"], "end": run[-1]["time"], "hours": len(run),
+                "cloud": round(sum(clouds) / len(clouds)) if clouds else None,
+                "precip_prob": max(pps) if pps else None}
+        if best is None or cand["hours"] > best["hours"]:
+            best = cand
+
+    for h in _hours_in(hours, day_start, day_end):
+        if _is_dry(h, pp_cut):
+            run.append(h)
+        else:
+            flush()
+            run = []
+    flush()
+    return best
+
+
+def rain_onset(hours, after_hm, day_end, pp_cut):
+    """First daylight hour STRICTLY AFTER after_hm (pass the dry window's end)
+    where rain kicks in — pairs with best_dry_window as '拍到这里、之后转雨'.
+    Returns 'HH:MM' or None (stays dry). Requiring a preceding dry window (the
+    caller passes best_dry_window['end']) avoids the false 'rain starts at X,
+    wrap up before then' on days that were already raining."""
+    ah, eh = int(after_hm[:2]), int(day_end[:2])
+    for h in hours:
+        hh = int(h["time"][:2])
+        if ah < hh <= eh and not _is_dry(h, pp_cut):
+            return h["time"]
+    return None
+
+
 def make_window(label, span, hours, light_dir=None, light_az=None):
     if not span or span[0] is None or span[1] is None:
         return None  # no window, or a half-open high-latitude golden window
@@ -126,7 +189,7 @@ def make_window(label, span, hours, light_dir=None, light_az=None):
     }
 
 
-def enrich_spot(name, query, lat, lon, geo_meta, date, wx, threshold, daily_window=("09:00", "17:00")):
+def enrich_spot(name, query, lat, lon, geo_meta, date, wx, threshold, daily_window=("06:00", "20:00")):
     tz = wx.get("utc_offset_hours", 8.0)
     sun = S.day_summary_json(lat, lon, date, tz)
     sunrise_dir = S.azimuth_to_compass(sun["sunrise_azimuth"])
@@ -145,6 +208,17 @@ def enrich_spot(name, query, lat, lon, geo_meta, date, wx, threshold, daily_wind
         windows["golden_pm"] = w_pm
     if w_day:
         windows["daytime"] = w_day
+
+    # Intraday intelligence: where's the actual dry window, when does rain start.
+    pp_cut = PP_CUTS.get(threshold, 50)
+    day_start = sun["sunrise"] or "06:00"
+    day_end = sun["sunset"] or "20:00"
+    bdw = best_dry_window(hours, day_start, day_end, pp_cut) if hours else None
+    day_windows = {
+        "best_dry_window": bdw,
+        # onset only makes sense as "the rain that ends the dry window"
+        "rain_onset": rain_onset(hours, bdw["end"], day_end, pp_cut) if (hours and bdw) else None,
+    }
 
     cut = CUTS.get(threshold, CUTS["balanced"])
     golden = [w for w in (windows.get("golden_pm"), windows.get("golden_am")) if w]
@@ -195,6 +269,7 @@ def enrich_spot(name, query, lat, lon, geo_meta, date, wx, threshold, daily_wind
             "weather": day.get("weather"),
         },
         "windows": windows,
+        "day_windows": day_windows,
         "recommended": recommended,
     }
 
@@ -208,24 +283,44 @@ def _km(v):
 
 
 def classify_day(spots):
-    """柴西 method: tag each day A-roll / B-roll / 赶路 by best shootability."""
-    scores = [s["recommended"]["score"] for s in spots
+    """柴西 method: tag each day A-roll / 抢窗 / B-roll / 赶路.
+
+    A single clear golden window must NOT label an all-day-stormy day an
+    'A-roll 重点日' (a real bug); gate the top label on day-level wetness and,
+    when a good window sits inside a wet day, call it a 抢窗日 and point at the
+    concrete dry window."""
+    scored = [s for s in spots
               if s.get("recommended") and s["recommended"].get("score") is not None]
-    if not scores:
-        # no hourly scores — fall back to day-level rain flags
+    if not scored:
         all_planb = all(s.get("recommended", {}).get("plan_b") for s in spots) if spots else True
         if all_planb:
             return "赶路·休整日", "天气欠佳或无足够数据，建议赶路/转场/室内，把好天气留给其他天。"
         return "B-roll 空镜日", "数据有限，按一般日处理，以环境空镜为主。"
-    best = max(scores)
-    if best >= 3.3:
-        return "A-roll 重点拍摄日", "天气光线俱佳，安排叙事主线与人物故事。"
+
+    best = max(s["recommended"]["score"] for s in scored)
+    pp_max = max((s.get("day_weather", {}).get("precip_prob_max") or 0) for s in scored)
+    precip_sum = max((s.get("day_weather", {}).get("precip_sum") or 0) for s in scored)
+    rain_dominated = pp_max >= 70 or precip_sum >= 8
+
+    ref = next((s for s in scored if s.get("day_windows", {}).get("best_dry_window")), None)
+    dw = ref["day_windows"]["best_dry_window"] if ref else None
+    onset = ref["day_windows"]["rain_onset"] if ref else None
+    hint = ""
+    if dw:
+        hint = f" 最佳干窗 {dw['start']}–{dw['end']}。"
+        if onset:
+            hint += f" 约 {onset} 起转雨，之前收工。"
+
+    if best >= 3.3 and not rain_dominated:
+        return "A-roll 重点拍摄日", "天气光线俱佳，安排叙事主线与人物故事。" + hint
+    if best >= 3.3 and rain_dominated:
+        return "抢窗日", "有好光窗口但当天多雨——把拍摄压到干窗、雨前收工。" + hint
     if best >= 2.3:
-        return "B-roll 空镜日", "光线一般，重点拍环境/细节空镜提升质感。"
-    return "赶路·休整日", "全天出片条件差，建议赶路/转场或改拍雨雾情绪向、室内/市集，把好天气留给其他天。"
+        return "B-roll 空镜日", "光线一般，重点拍环境/细节空镜提升质感。" + hint
+    return "赶路·休整日", "全天出片条件差，建议赶路/转场或改拍雨雾情绪向、室内/市集。" + hint
 
 
-def plan(inp, cfg):
+def plan(inp, cfg, include_poi=False):
     days_in = inp.get("days") or []
     if not days_in:
         return {"error": "input has no days", "hint": '需要 {"days":[{"date":"YYYY-MM-DD","spots":[...]}]}',
@@ -302,6 +397,25 @@ def plan(inp, cfg):
             wx_cache[key] = wx
         return wx_cache[key]
 
+    poi_cache = {}
+
+    def poi_for(lat, lon):
+        """Named nearby vantage points as source-tagged B-roll 机位 candidates."""
+        key = (round(lat, 2), round(lon, 2))
+        if key not in poi_cache:
+            try:
+                res = P.discover(lat, lon, cfg, radius=3000)
+                named = [s for s in res.get("spots", []) if s.get("named")][:8]
+                poi_cache[key] = [{"name": s["name"], "kind": s["kind"], "gcj02": s["gcj02"],
+                                   "has_wiki": s["has_wiki"], "source": res.get("provider")}
+                                  for s in named]
+                effective["poi"] = res.get("provider")
+                quality.add("机位：" + res.get("note", ""))
+            except Exception as e:
+                C.eprint(f"poi 取用失败（跳过）：{e}")
+                poi_cache[key] = []
+        return poi_cache[key]
+
     out_days = []
     for d in days_in:
         date = d["date"]
@@ -314,7 +428,10 @@ def plan(inp, cfg):
                                   "geocode": meta})
                 continue
             wx = weather_for(lat, lon)
-            spots_out.append(enrich_spot(name, query, lat, lon, meta, date, wx, threshold, daily_window))
+            sp = enrich_spot(name, query, lat, lon, meta, date, wx, threshold, daily_window)
+            if include_poi:
+                sp["nearby_poi"] = poi_for(lat, lon)
+            spots_out.append(sp)
         role, role_note = classify_day(spots_out)
         out_days.append({"date": date, "weekday": wd, "day_role": role,
                          "day_role_note": role_note, "spots": spots_out})
@@ -330,10 +447,11 @@ def plan(inp, cfg):
             "region": cfg.get("region"), "language": cfg.get("language"),
             # only the providers plan.py actually exercises; reports the EFFECTIVE
             # provider used (after any no-key fallback), not just what was configured.
-            # POI is run separately via poi.py, so it is not reported here.
+            # POI only appears when --poi was used.
             "providers": {
                 "weather": effective.get("weather", cfg["providers"]["weather"].get("provider")),
                 "geocode": effective.get("geocode", cfg["providers"]["geocode"].get("provider") + " (未调用)"),
+                **({"poi": effective["poi"]} if "poi" in effective else {}),
                 "sun": "builtin",
             },
             "style": cfg.get("style"),
@@ -347,11 +465,12 @@ def main():
     p = argparse.ArgumentParser(description="Plan a vlog shoot from a day-by-day route.")
     p.add_argument("--input", default=None, help="JSON file ({days:[...]}); reads stdin if omitted")
     p.add_argument("--config", default=None)
+    p.add_argument("--poi", action="store_true", help="also attach named nearby vantage points (机位) per spot (extra Overpass calls)")
     args = p.parse_args()
     raw = open(args.input, encoding="utf-8").read() if args.input else sys.stdin.read()
     inp = json.loads(raw)
     cfg = C.load_config(args.config)
-    C.emit(plan(inp, cfg))
+    C.emit(plan(inp, cfg, include_poi=args.poi))
 
 
 if __name__ == "__main__":
